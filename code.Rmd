@@ -1,6 +1,6 @@
 ---
 title: "Assignment"
-author: "Hans"
+author: "Hans, Iwan, Yunus, Mark"
 date: "April 9, 2018"
 output: pdf_document
 ---
@@ -11,11 +11,15 @@ library(tidyverse)
 library(readr)
 library(randomForest)
 library(class)
+library(e1071)
+require(gbm)
+library(viridis)
+library(reshape2)
 ```
 
 ## Load the data
 
-Data is in quite a weird format. Let us apply some changes to the data such that observations correspond to rows and features correspond to columns.
+Data is in quite a weird format. Let us apply some changes to the data such that observations correspond to rows and features correspond to columns (i.e. translate it to a tidy format)
 
 ```{r cars}
 train <-  read_delim("Train_call.txt",delim="\t") %>%
@@ -41,30 +45,113 @@ test$Sample <- NULL
 
 ## Fit a random forest, k-NN and support vector classifier.
 
+Random forest may be interesting as it's not been used by the authors of paper Iwan found. k-NN is a very naive but sometimes powerful feature. It suffers from high variance, however. The support vector classifier isn't tried in that same paper with a non-linear kernel. May be a good idea to try this too.
+
+Finally, we will try a boosted decision tree classifier from the gbm package. Such boosting can be very powerful in reducing the bias of the classifier (but not necessarily the variance). It is prone to overfit but still it may be good to use it here as boosting allows for heterogeneous instances which is clearly something we are dealing with in the case of cancer cells; that was also the motivation for using the knowledge-based network as we saw in the lecture.
+
+https://datascienceplus.com/gradient-boosting-in-r/
+
 ```{r fig.height=10}
 set.seed(12)
 rf.model <- randomForest(Subgroup ~ ., data=train, ntrees = 1000, importance=TRUE)
+plot(rf.model)
+legend("top", colnames(rf.model$err.rate),col=1:4,cex=0.8,fill=1:4)
 varImpPlot(rf.model)
 rf.predict <- predict(rf.model, test)
 mean(test$Subgroup == rf.predict)
 ```
 
 
+Boosted decision trees. I took this implementation from some Rbloggers blog. Maybe we should look at the parameters too (but it works already quite well. ) Summary shows one mutation that is really important for this cell (there is a one-to-one correspondence between this chromosome having a value 2 and it being a HER-2 cell if we inspect the validation and training data).
+
+Train the boosted decision tree classifier (gbm).
+
+Maybe switch it to xgboost. Seems to be popular, both on Kaggle and in literature (e.g. in https://psb.stanford.edu/psb-online/proceedings/psb18/ching.pdf)
+
+```{r fig.width=8}
+rf.boost = gbm(Subgroup ~ . ,data = train, distribution = "multinomial", n.trees = 10000, shrinkage = 0.01, interaction.depth = 4)
+par(oma=c(0,10,0,0))
+output <-summary(rf.boost, cBars=10, order=TRUE, las=1)
+```
+
+Evaluate accuracy of thsi classifier on the test set. We see that it has extremely high accuracy. May be reflecting overfitting.
+
+```{r}
+n.trees = seq(from=1 ,to=100, by=3) #no of trees-a vector of 100 values 
+
+#Generating a dataframe of predictions for the number of trees.
+prob_df <- predict(rf.boost,test,n.trees = n.trees, type="response") %>% melt()
+test_labels <- test$Subgroup %>% as.data.frame() %>% mutate(Sample = row_number())
+names(test_labels) <- c("True_type","Sample")
+names(prob_df) <- c("Sample","Type", "N.trees", "p_hat")
+predictions <- prob_df %>%
+  group_by(Sample, N.trees) %>%
+  filter(p_hat == max(p_hat)) %>%
+  arrange(N.trees, Sample, Type) %>%
+  merge(test_labels, by=c("Sample")) %>%
+  group_by(N.trees) %>%
+  summarize(Accuracy = sum(Type == True_type)/n())
+
+#Calculating The Mean squared Test Error
+predictions %>% ggplot(aes(x=N.trees, y=Accuracy)) +
+  geom_line()
+```
+
+gbm() also reports on the importances of different features (i.e. chromosome regions). Let us plot the associations between the k most important features for test and training data. Note that there does not seem to be another magic marker that corresponds one-to-one to a cell-type. 
+
+```{r eval=FALSE, include=FALSE}
+selected <- c("C17_2914621_3387328")
+k = 10
+selected_cols <- output$var[1:10]
+train %>% mutate(C17_2914621_3387328 = as.factor(C17_2914621_3387328)) %>%
+  ggplot(aes(x=Subgroup, y=C17_2914621_3387328, fill = C17_2914621_3387328)) +
+  geom_col() +
+  scale_fill_viridis(discrete=T)
+```
+
+```{r fig.height=6}
+k = 9
+numRows = floor(k/3)
+selected_cols <- output$var[1:k] %>% as.character()
+test[c(selected_cols, "Subgroup")] %>% melt() %>%
+  mutate(value = as.factor(value)) %>%
+  ggplot(aes(x=Subgroup, y=variable, fill = value)) +
+  geom_col() + facet_wrap( ~ variable, nrow = numRows) + 
+  theme(axis.ticks.y = element_blank(), axis.text.y=element_blank(), axis.title.y = element_blank()) + 
+  ggtitle("Distributions of gains/losses over most important chromosomes as identified by the GBM classifier (test data!)") +
+  scale_fill_viridis(discrete=T)
+
+train[c(selected_cols, "Subgroup")] %>% melt() %>%
+  mutate(value = as.factor(value)) %>%
+  ggplot(aes(x=Subgroup, y=variable, fill = value)) +
+  geom_col() + facet_wrap( ~ variable, nrow = numRows) + 
+  theme(axis.ticks.y = element_blank(), axis.text.y=element_blank(), axis.title.y = element_blank()) +
+  ggtitle("Distributions of gains/losses over most important chromosomes as identified by the GBM classifier (training data!)") + 
+  scale_fill_viridis(discrete=T)
+```
+
+# The other classifiers
+
+Very simple k-nearest neighbor classifier. Doesn't seem to work very well. May suffer from noise. I hypothesized a correlation-based measure would maybe be more appropriate. However, problem is that the matrix of observations isn't invertible so it does not work.... We could try some dimension reduction e.g. through PCA and then do it but not a fan.
+
+
 ```{r}
 nn3 <- knn(train[,-1], test[,-1], unlist(train$Subgroup),  k=5, prob=TRUE)
 mean(nn3 == test$Subgroup)
+
 ```
 
-Fit an SVM classifier
+Fit an SVM classifier We will try both the linear and RBF kernel.
 
 ```{r}
-library(e1071)
 tuned_svm<-tune(svm, train.x=train[,-1], train.y = unlist(train$Subgroup),kernel="linear", range=list(cost=10^(-2:2)))
 print(tuned_svm)
 svm_good_model<-svm(Subgroup~., data=train, kernel="linear",cost=tuned_svm$best.parameters$cost)
 svm.predict <- predict(svm_good_model, test)
 mean(svm.predict == test$Subgroup)
 ```
+
+Tuned SVM seems to be overfitting; performance on test set declines.
 
 ```{r}
 library(e1071)
@@ -77,9 +164,15 @@ mean(svm.predict == test$Subgroup)
 
 # Scores on the first two principal components.
 
+PCA doesn't yield clear patterns in the scores. Also, it's discussed in literature that it's only really appropriate when you think some underlying unobservable process generates the labels. Here, that seems a bit far-fetched.
+
 ```{r}
 PCA.out <- scale(train[,-1], center = TRUE, scale = TRUE) %>%  prcomp()
 plot(PCA.out$sdev^2/sum(PCA.out$sdev^2)*100)
 plot(PCA.out$x[,1], PCA.out$x[,2], col = train$Subgroup, pch=16)
 ```
 
+# Other ideas:
+- Investigate if perfect association stems from clinical test. If so, discuss that it may be cheating.
+- Try binary classification between the triple negative and HR+ cells to select features that distinguish the two.
+- 
