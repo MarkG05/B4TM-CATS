@@ -1,0 +1,85 @@
+---
+title: "Assignment"
+author: "Hans"
+date: "April 9, 2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readr)
+library(randomForest)
+library(class)
+```
+
+## Load the data
+
+Data is in quite a weird format. Let us apply some changes to the data such that observations correspond to rows and features correspond to columns.
+
+```{r cars}
+train <-  read_delim("Train_call.txt",delim="\t") %>%
+  mutate(chrom_loc = as.factor(paste0("C",Chromosome,"_",Start,"_",End)))
+
+metadata <- train %>% subset(select=c(Chromosome, Start, End, Nclone, chrom_loc))
+
+train <- train %>% gather(Sample,"measurements", which(grepl("Array",names(train)))) %>%
+  subset(select=c(Sample, measurements, chrom_loc)) %>% spread(chrom_loc, measurements)
+
+train <- read_delim("Train_clinical.txt", delim="\t") %>%
+  mutate(Subgroup = as.factor(Subgroup)) %>%
+  merge(train)  %>% as.data.frame()
+
+set.seed(130910)
+is.train <- sample(c(TRUE,FALSE), nrow(train), replace = TRUE, prob = c(0.8,0.2))
+test <- train[!is.train,] %>% as.data.frame()
+train <- train[is.train,] %>% as.data.frame()
+
+train$Sample <- NULL
+test$Sample <- NULL
+```
+
+## Fit a random forest, k-NN and support vector classifier.
+
+```{r fig.height=10}
+set.seed(12)
+rf.model <- randomForest(Subgroup ~ ., data=train, ntrees = 1000, importance=TRUE)
+varImpPlot(rf.model)
+rf.predict <- predict(rf.model, test)
+mean(test$Subgroup == rf.predict)
+```
+
+
+```{r}
+nn3 <- knn(train[,-1], test[,-1], unlist(train$Subgroup),  k=5, prob=TRUE)
+mean(nn3 == test$Subgroup)
+```
+
+Fit an SVM classifier
+
+```{r}
+library(e1071)
+tuned_svm<-tune(svm, train.x=train[,-1], train.y = unlist(train$Subgroup),kernel="linear", range=list(cost=10^(-2:2)))
+print(tuned_svm)
+svm_good_model<-svm(Subgroup~., data=train, kernel="linear",cost=tuned_svm$best.parameters$cost)
+svm.predict <- predict(svm_good_model, test)
+mean(svm.predict == test$Subgroup)
+```
+
+```{r}
+library(e1071)
+tuned_svm<-tune(svm, train.x=train[,-1], train.y = unlist(train$Subgroup),kernel="radial", range=list(cost=2^seq(-5,15,2), gamma=2^seq(-15,3,2)))
+print(tuned_svm)
+svm_good_model<-svm(Subgroup~., data=train, kernel="radial",cost=tuned_svm$best.parameters$cost)
+svm.predict <- predict(svm_good_model, test)
+mean(svm.predict == test$Subgroup)
+```
+
+# Scores on the first two principal components.
+
+```{r}
+PCA.out <- scale(train[,-1], center = TRUE, scale = TRUE) %>%  prcomp()
+plot(PCA.out$sdev^2/sum(PCA.out$sdev^2)*100)
+plot(PCA.out$x[,1], PCA.out$x[,2], col = train$Subgroup, pch=16)
+```
+
