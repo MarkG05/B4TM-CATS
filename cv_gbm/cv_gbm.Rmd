@@ -1,0 +1,139 @@
+---
+title: "CV gbm"
+author: "Hans"
+date: "April 15, 2018"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup}
+knitr::opts_chunk$set(include = TRUE)
+# Needed libraries
+library(tidyverse)
+library(readr)
+library(viridis)
+library(gbm)
+library(reshape2)
+library(caTools)
+library(class)
+library(caret)
+library(doMC)
+
+# Load data
+data <-  read_delim("Train_call.txt",delim="\t") %>%
+  mutate(chrom_loc = as.factor(paste0("C",Chromosome,"_",Start,"_",End)))
+metadata <- data %>% subset(select=c(Chromosome, Start, End, Nclone, chrom_loc))
+data <- data %>% gather(Sample,"measurements", which(grepl("Array",names(data)))) %>%
+  subset(select=c(Sample, measurements, chrom_loc)) %>% mutate(measurements = as.numeric(measurements)) %>%
+  spread(chrom_loc, measurements)
+data <- read_delim("Train_clinical.txt", delim="\t") %>%
+  mutate(Subgroup = as.factor(Subgroup)) %>%
+  merge(data)  %>% as.data.frame()
+data$Sample <- NULL
+
+roundToNearest <- function(x,c) {
+  round(x/c)*c %>% return()
+}
+```
+
+Some parameter settings.
+
+```{r}
+# Splitting parameters
+frac_test = .1        # Fraction we set apart for the test set.
+
+# Number of loops & folds
+outerloop_iter = 100
+k = 10L
+```
+
+# Tuning the GBM classifier
+
+Here, we will use the caret package to find good parameters for the GBM classifier. The optimal parameters are reported to be an interaction depth of 3, minimal 3 observations per node and 140 trees. However, this accuracy only holds for 140-180 trees. The second best parameter set seems to be an interaction depth of 1, 10 minimal observations per node and is more robust (approximately stable from 230 - 600 trees.) Let us work with these settings and 400 trees in the remainder.
+
+```{r tuning the gbm parameters}
+set.seed(9)
+registerDoMC(cores = 8)
+
+# Stratisfied sampling for test and training data.
+train_rows = sample.split(data$Subgroup, SplitRatio=1-frac_test)
+train = data[train_rows,]
+test = data[-which(train_rows),]
+
+# Parameter tuning using caret grid with k-fold cross-validation. 
+caretGrid <- expand.grid(interaction.depth=c(1, 2, 3, 5), n.trees = (0:70)*10,
+                   shrinkage=c(0.01),
+                   n.minobsinnode=c(3,5,10))
+cvIndex <- createFolds(factor(train$Subgroup), k, returnTrain = T)
+tc <- trainControl(index = cvIndex, method = 'cv', number = k, allowParallel = T)
+gbm.caret <- caret::train(Subgroup ~ ., data=train, method="gbm", distribution="multinomial", bag.fraction = .75,
+              trControl=tc, verbose=FALSE, tuneGrid=caretGrid, metric="Accuracy")  
+```
+
+Display results in plot and table.
+
+```{r}
+labels <- c("10" = "MOPN = 10", "3" = "MOPN = 3", "5" = "MOPN = 5")
+
+gbm.caret$results %>% ggplot(aes(x=n.trees, y=Accuracy, col = factor(interaction.depth))) + 
+  geom_line() +
+  facet_grid(n.minobsinnode ~ ., labeller = labeller(n.minobsinnode = labels)) +
+  ggtitle("Classification accuracy for different GBM parameters")
+
+gbm.caret$results %>% arrange(-Accuracy) %>% head(100)
+```
+
+# Cross-validation for GBM classifier and selection of features.
+
+Here, we will do cross-validation on the entire dataset for tuning parameters and evaluate accuracies.
+
+```{r cv}
+accuracies.gbm <- rep(NA,outerloop_iter)
+ranks.gbm <- data.frame(chrom = names(data[,-1])) %>% mutate(total_rank = 0, times_included = 0)
+
+# Set parameters as determined above.
+cv.ntrees = 350
+cv.MOPN = 5
+cv.interactiondepth = 1
+
+# Start iterations
+
+for (iter in 1:outerloop_iter) {
+  
+  # Split into a train and test set (stratisfied sampling)
+  train_rows = sample.split(data$Subgroup, SplitRatio=1-frac_test)
+  train = data[train_rows,]
+  test = data[-which(train_rows),]
+  test_label = as.numeric(data[-which(train_rows),]$Subgroup)
+  
+  # GBM classifier (typically somewhat slow. 400 trees seemed OK in another script.)
+  gbm.model = gbm(Subgroup ~ . ,data = train, distribution = "multinomial", n.trees = cv.ntrees, shrinkage = 0.01, 
+                  interaction.depth = 5, n.minobsinnode = cv.MOPN, bag.fraction = .75, class.stratify.cv = T, n.cores = 4)
+  gbm.test.predictions <- predict(gbm.model,test, n.trees = cv.ntrees, type="response") %>% melt() %>% group_by(Var1) %>% filter(value == max(value)) %>% arrange(Var1) %>% subset(select=c("Var2"))
+  accuracy.gbm.full_dataset = mean(gbm.test.predictions == as.character(test$Subgroup))
+  gbm.relInf <- melt(gbm::relative.influence(gbm.model, n.trees = cv.ntrees))
+  gbm.relInf$chrom <- rownames(gbm.relInf)
+  gbm.relInf <- gbm.relInf %>% arrange(-value) %>% filter(value > 0) %>% mutate(rank = row_number())
+  ranks.gbm <- gbm.relInf %>% merge(ranks.gbm, all.x = TRUE, all.y = TRUE) %>% mutate(total_rank = ifelse(is.na(rank), total_rank, total_rank + rank), times_included = ifelse(is.na(rank),times_included, times_included + 1)) %>% subset(select=c("chrom", "total_rank", "times_included"))
+  
+  accuracies.gbm[iter] = accuracy.gbm.full_dataset
+}
+
+ranks.gbm <- ranks.gbm %>% filter(times_included>0) %>%
+  mutate(avg_rank = total_rank/times_included) %>%
+  arrange(avg_rank) 
+ranks.gbm %>% write_csv("summary_gbm_full_dataset_cv")
+data.frame(accuracy = accuracies.gbm) %>% write_csv("summary_accuracies_cv")
+
+gbm.relInf %>% ggplot(aes(x=rank, y = value)) + geom_col() + scale_y_continuous(limits = c(0,50)) + 
+  ggtitle("Plot showing the relative influence of the selected variables")
+```
+
+# Summary of results
+
+```{r}
+ranks.gbm <- read_csv("summary_gbm_full_dataset_cv") %>% filter(times_included > 10) %>% arrange(avg_rank)
+ranks.gbm %>% head(50)
+mean(accuracies.gbm)
+```
