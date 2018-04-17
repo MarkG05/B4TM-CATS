@@ -1,0 +1,53 @@
+---
+title: "Markers_GBM"
+author: "Hans"
+date: "April 17, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readr)
+library(randomForest)
+library(class)
+library(e1071)
+require(gbm)
+library(viridis)
+library(reshape2)
+
+# Load data
+data <-  read_delim("../Train_call.txt",delim="\t") %>%
+  mutate(chrom_loc = as.factor(paste0("C",Chromosome,"_",Start,"_",End)))
+metadata <- data %>% subset(select=c(Chromosome, Start, End, Nclone, chrom_loc))
+data <- data %>% gather(Sample,"measurements", which(grepl("Array",names(data)))) %>%
+  subset(select=c(Sample, measurements, chrom_loc)) %>% mutate(measurements = as.numeric(measurements)) %>%
+  spread(chrom_loc, measurements)
+data <- read_delim("../Train_clinical.txt", delim="\t") %>%
+  mutate(Subgroup = as.factor(Subgroup)) %>%
+  merge(data)  %>% as.data.frame()
+data$Sample <- NULL
+```
+
+Let us only select chromesomes which are at least 20 times among the important ones for the 100 folds and have an average rank below 100. 
+
+```{r}
+# Load the average ranks of chromosomes
+selected_chromosomes <-  read_csv("summary_gbm_full_dataset_cv") %>% filter(times_included > 20) %>% filter(avg_rank < 100)
+head(selected_chromosomes, 15)
+```
+
+
+```{r fig.height=10, fig.width=8}
+k = 15
+numRows = floor(k/3)
+
+data[c(selected_chromosomes$chrom[1:k], "Subgroup")] %>% melt() %>%
+  mutate(value = as.factor(value)) %>%
+  ggplot(aes(x=Subgroup, y=variable, fill = value)) +
+  geom_col() + facet_wrap( ~ variable, nrow = numRows) + 
+  theme(axis.ticks.y = element_blank(), axis.text.y=element_blank(), axis.title.y = element_blank()) + 
+  ggtitle("Distributions of gains/losses over most important chromosomes as identified by the GBM classifier (test data!)") +
+  scale_fill_viridis(discrete=T)
+```
