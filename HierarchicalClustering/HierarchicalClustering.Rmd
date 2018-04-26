@@ -1,0 +1,404 @@
+---
+title: "HierarchicalClustering"
+author: "H.C. de Ferrante"
+date: "24 april 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Load necessary packages.
+packages <- c("plyr","dplyr","tidyverse","readr","viridis","reshape2","glmnet","nnet","caTools","ggdendro","latex2exp","gplots","gbm","scales","doMC","caret","knitr","grid","doParallel","dendextend")
+#lapply(packages,install.packages)
+lapply(packages, require, character.only = TRUE)
+knitr::opts_chunk$set(include = TRUE)
+
+# Load data and some other options.
+source("../formatData.R")
+
+# Here we load the function clusterFeatures. This function takes in a tree (hcd object)  
+source("functionsHierClust.R")
+```
+
+
+# Motivation
+
+All work so far has been based on whether a chromosome segment was assigned a score of -1, 0, 1 or 2. With a cross-validation procedure, we found that we can classify with an accuracy of just over 80% with gradient-boosted models. However, some loss-of-functions are not necessarily caused by loss of function of a single segment but rather by a e.g. a loss of an entire chromosome arm. Therefore, we want to investigate here if we can increase accuracy further by using metrics that hold for clusters of chromosome segments. Here, we will do so by hierarchical clustering.
+
+The proposed procedure consists of the following:
+
+1) Find appropriate tuning parameters for `gbm` and `rho` by doing some cross-validation on test/training splits. We do this by doing 5 iterations over test training splits with 10-fold cross-validation. 
+
+2) Do 100 folds of test/training split with selected hyperparameters and selected `rho` to compare performance. For Lasso, we do cross-validation within the loop. For gbm we will use parameters as determined above.
+
+# 1) Cross-validation procedure.
+
+Cross-validation is done by translating the training split (90% of data) according to one hierarchical clustering. We use "informal" as formally one would have to redo the hierarchical clustering procedure for each fold of the cross-validation procedure. However, we want to stick to `caret` for cross-validation and it is impossible to preprocess data in a custom way for each folds. Thus, let us handwaive.
+
+A defense for this decision may be that correlations can be thought to be relatively stable if we sample 81 out of 90 observations such that the hierarchical clusterings would be similar (so that this handwaiving is not very problematic).
+
+```{r tuning the gbm parameters}
+
+# Set seed for reproducibility and setup parallel computing.
+set.seed(9)
+cl <- makeCluster(detectCores(), type='PSOCK')
+registerDoParallel(cl)
+
+for (i in 1:4) {
+
+  # Do stratisfied sampling for test and training data.
+  frac_test <- .1
+  train_rows = sample.split(data$Subgroup, SplitRatio=1-frac_test)
+  train = data[train_rows,]
+  test = data[-which(train_rows),]
+  
+  # Parameter grid we want to search using caret with k-fold cross-validation. Also, ensure that the
+  # splits for cross-validation are the same for each rho such that we can compare outcome.
+  k <- 10
+  caretGrid <- expand.grid(interaction.depth=c(1, 2, 3, 5), n.trees = (0:25)*40,
+                     shrinkage=c(0.01),
+                     n.minobsinnode=c(3,5,10))
+  cvfolds <- createFolds(factor(train$Subgroup), k, returnTrain = T)
+  
+  # Do grid-search for rho. The function cv.hcgmb.informal uses `caret` for cross-validation. 
+  rho.grid = seq(0,0.6,0.05)
+  results <- lapply(rho.grid, function(rho) cv.hcgbm.informal(train, cvfolds, rho))
+  
+  # Save results to a file.
+  ldply(results, rbind) %>% write_csv(paste0("data/cv_gbm_results_fold",i,".csv"))
+}
+# turn parallel processing off and run sequentially again:
+registerDoSEQ()
+```
+
+# 2) 100 folds with good parameters selected by cross-validation above.
+
+Here, we do the 100 times splitting into test and training and estimating accuracy for both classifiers. 
+
+```{r cross-validation, echo = TRUE, warning=FALSE, include=FALSE}
+set.seed(14)
+
+# Parameter settings.
+cv.ntrees = 200
+cv.MOPN = 5
+cv.interactiondepth = 1
+frac_test = 0.1
+outerloop_iter = 100
+thresh = .40
+cv <- 10
+
+# Dataframes to save results (ranks and accuracies)
+ranks.gbm <- list()
+lasso_coefs <- list()
+accuracies.gbm <- rep(NA,outerloop_iter)
+accuracies.lasso <- rep(NA,outerloop_iter)
+
+for (iter in 1:outerloop_iter) {
+  
+  # Split into a train and test set (stratisfied sampling)
+  train_rows <-  sample.split(data$Subgroup, SplitRatio=1-frac_test)
+
+  # Do hierarchical clustering based on training data only.
+  m <- arrange(data[train_rows,],Subgroup)[-1] %>% as.matrix()
+  hcd <- cluster_fun(dist_fun(t(m)))
+  
+  # Transform both test and training data based on hierarchical clustering based on training data.
+  cluster.result <- clusterFeatures(hcd, data, thresh)
+  merged.data <- cluster.result[[1]]
+  clusterDic <- cluster.result[[2]]
+  train <- merged.data[train_rows,]
+  test <- merged.data[-which(train_rows),]
+  test_label <- as.numeric(merged.data[-which(train_rows),]$Subgroup)
+  
+  # -------------------------------------   GBM Classifier    -------------------------
+  gbm.model = gbm(Subgroup ~ . ,data = train, distribution = "multinomial", n.trees = cv.ntrees, shrinkage = 0.01, 
+                  interaction.depth = 5, n.minobsinnode = cv.MOPN, bag.fraction = .75, class.stratify.cv = T, n.cores = 4)
+  gbm.test.predictions <- predict(gbm.model,test, n.trees = cv.ntrees, type="response") %>% melt() %>% group_by(Var1) %>% filter(value == max(value)) %>% arrange(Var1) %>% subset(select=c("Var2"))
+  accuracy.gbm.full_dataset = mean(gbm.test.predictions == as.character(test$Subgroup))
+  
+  # Save the ranks.
+  gbm.relInf <- melt(gbm::relative.influence(gbm.model, n.trees = cv.ntrees))
+  gbm.relInf$chrom <- rownames(gbm.relInf)
+  gbm.relInf <- gbm.relInf %>% merge(clusterDic, by.x = "chrom", by.y = "cluster", all.y = T, all.x = T) %>%
+    mutate(chrom = ifelse(is.na(elements), chrom, elements)) %>%
+    arrange(-value) %>% filter(value > 0) %>% mutate(rank = row_number())
+  gbm.relInf$elements <- NULL
+  ranks.gbm[[iter]] <- gbm.relInf
+  accuracies.gbm[iter] = accuracy.gbm.full_dataset
+  
+   # -------------------------------------   The Lasso        -------------------------
+  
+  # Transform the data s.t. we use dummies rather than factors.
+  x.factorCols <- lapply(merged.data[-1],is.factor) %>% unlist()
+  y.joined <- merged.data$Subgroup
+  x.joined <- merged.data[-1]
+  names(x.joined)[x.factorCols] <- paste0(names(x.joined)[x.factorCols],'_')
+  x.joined <- model.matrix(~ ., x.joined)
+    
+  # Transform the data s.t. we use dummies rather than factors. Needs to be redone as features change each iteration.
+  x.factorCols <- lapply(merged.data[-1],is.factor) %>% unlist()
+  y.joined <- merged.data$Subgroup
+  x.joined <- merged.data[-1]
+  names(x.joined)[x.factorCols] <- paste0(names(x.joined)[x.factorCols],'_')
+  x.joined <- model.matrix(~ ., x.joined)
+  
+  # Split data in same way as gbm
+  x.train = x.joined[train_rows,]
+  y.train = y.joined[train_rows]
+  x.test = x.joined[-which(train_rows),]
+  y.test = y.joined[-which(train_rows)]
+  
+  # Lasso regression with cross-validation for proper lambda. Choose the minimal lambda within 1SE of the cross-fitted error.
+  glmnet.cvfit.lasso <- glmnet::cv.glmnet(x.train, y.train, family="multinomial", nfolds = cv, alpha = 1)
+  lasso.test.predictions <- glmnet::predict.cv.glmnet(glmnet.cvfit.lasso, newx = x.test, s = glmnet.cvfit.lasso$lambda.1se, type = "class")
+  accuracies.lasso[iter] = mean(lasso.test.predictions == y.test)
+  
+ # Extract the lasso coefficients. Note, some coefficients may be included more than one time as lasso uses dummies. Filter therefore to one dummy per coef.
+  lasso_coefficients <- lapply(coef(glmnet.cvfit.lasso, s = "lambda.1se"), as.matrix) %>% melt() %>% filter(value != 0) %>% subset(select=c("Var1","L1","Var2"))
+  names(lasso_coefficients) <- c("chrom","Subgroup","Included")
+  lasso_coefs[[iter]] <- lasso_coefficients %>% filter(chrom != "(Intercept)") %>% subset(select=c("chrom")) %>%
+    merge(clusterDic, by.x = "chrom", by.y = "cluster", all.x = T) %>% 
+    mutate(chrom = ifelse(is.na(elements), as.character(gsub("_[0-9]*$","",chrom)), elements)) %>% 
+    group_by(chrom) %>% filter(row_number() == 1) %>%
+    subset(select=c("chrom"))
+}
+
+lasso.summary <- lasso_coefs %>% melt() %>% group_by(chrom) %>% summarize(times_selected = n()) %>% arrange(-times_selected)
+gbm.summary <- ranks.gbm %>% melt() %>% spread(variable, value) %>%
+  group_by(chrom) %>% summarize(avg_rank = sum(rank)/n(), times_included = n(), avg_relInf = mean(value)) %>% arrange(avg_rank)
+```
+
+Evaluate outcome:
+
+```{r}
+paste0("Mean accuracy lasso: ",mean(accuracies.lasso),"+-",sd(accuracies.lasso)/sqrt(outerloop_iter))
+paste0("Mean accuracy GBM: ",mean(accuracies.gbm),"+-",sd(accuracies.gbm)/sqrt(outerloop_iter))
+```
+
+# Inspect selected features
+
+```{r}
+merge(lasso.summary, gbm.summary, all = T) %>% arrange(-avg_relInf, -times_selected) %>% head(100) %>% kable() 
+```
+
+
+# Plots
+
+Within this section, we include code to generate plots we will use in the report.
+
+## Plots of cross-validation of GBM and rho (all settings)
+
+```{r message=FALSE, warning=FALSE, fig.height=7, fig.width=12}
+dfs <- lapply(1:4, function(i) read_csv(paste0("data/cv_gbm_results_fold",i,".csv"))) %>% ldply(rbind) %>%
+  group_by(shrinkage, interaction.depth, n.minobsinnode, n.trees, rho) %>%
+  summarize(mean.cv.accuracy = mean(Accuracy), se.cv.accuracy = sqrt(sum(AccuracySD^2)/40))
+
+labels.mopn <- c("10" = "MOPN: 10", "3" = "MOPN: 3", "5" = "MOPN: 5")
+labels.id <- c("1" = "Depth: 1", "2" = "Depth: 3", "3" = "Depth: 3", "5" = "Depth: 5")
+
+dfs %>% ggplot(aes(x=n.trees/100, y=mean.cv.accuracy, col = factor(rho))) + 
+  geom_line() +
+  geom_point(, size = .5) +
+  facet_grid(n.minobsinnode ~ interaction.depth, labeller = labeller(n.minobsinnode = labels, interaction.depth = labels.id)) +
+  ggtitle("Classification accuracy for different GBM parameters") +
+  scale_x_continuous(breaks = seq(0,10,2)) +
+  scale_y_continuous(limits = c(.70, .90)) +
+  xlab("Number of trees (x100)") +
+  ylab("Mean 10-fold CV accuracy on train set (based on 4 iterations)") +
+  theme_minimal()
+  
+dfs %>% arrange(-mean.cv.accuracy) %>% head(100)
+```
+
+### Plot restricted to MOPN = 5 and stumps
+
+```{r fig.height=2.5, fig.width=4.5}
+dfs %>% filter(n.minobsinnode == "5", interaction.depth == "1") %>%
+  ggplot(aes(x=n.trees/100, y=mean.cv.accuracy, col = factor(rho))) +
+  scale_shape_manual(values=shapes) +
+  geom_line() +
+  geom_point(size=1) +
+  scale_x_continuous(breaks = seq(0,10,2)) +
+  scale_y_continuous(limits = c(.75, .88)) +
+  guides(col = guide_legend(title=TeX("Cut-off ($1-\\rho$)"), ncol = 2, byrow = T)) +
+  scale_shape_manual(values=shapes) +
+  xlab("Number of trees (x100)") +
+  ylab("Mean 10-fold CV accuracy") +
+  theme_bw()
+
+ggsave("figs/results_cv_gbm_rho.pdf", device="pdf", width = 4.5, height = 3)
+```
+
+## Histogram of Spearman correlations
+
+```{r histogram of spearman correlations, fig.height=3, fig.width=4}
+m <- arrange(data,Subgroup)[-1] %>% as.matrix()
+corrMatrix <- cor(m, method = "spearman") %>% as.matrix()
+corrMatrix[lower.tri(corrMatrix, diag=T)] <- NA
+histogram.plot <- corrMatrix %>% melt() %>% filter(is.na(value)==F) %>%
+  subset(select=c(value)) %>% ggplot(aes(x=value)) + 
+  geom_histogram(aes(y=1/100000*..count..), bins = 50, color = "#C13232", fill = "#e09898") +
+  xlab(TeX(paste0("Spearman Correlation ($\\rho$)"))) +
+  ylab("Count (x 100,000)") +
+  theme_classic() + 
+  scale_y_continuous(position="right") +
+  scale_x_continuous(breaks = seq(-0.4,1,.2)) + 
+  transp.background +
+  theme(plot.margin=grid::unit(c(2,0.3,0,2), "cm"))
+corrMatrix <- NULL
+ggsave("figs/histogram-spearman.pdf", plot = histogram.plot, device="pdf", width=4, height=3)
+```
+
+## Global heatmap
+
+Here, we construct a global heatmap. The heatmap will have the customary blue-white-red color coding, 
+
+```{r global heatmap}
+# Get labels for the columns
+rowBreaks <- c(0,cumsum(tally(group_by(arrange(data,Subgroup)[1],Subgroup))$n))
+labeledRows <- round(1/2*(rowBreaks + lag(rowBreaks)))[-1]
+rowLabels <- sapply(1:dim(data)[1], function(index) ifelse(index %in% labeledRows, as.character(arrange(data,Subgroup)$Subgroup[index]),NA))
+
+# Plot the dendogram and color edges by chromosome.
+hcd <- cluster_fun(dist_fun(t(m)))
+
+# Get a list of chromosomes by index
+colmap.dendro <- head(rep(redBlueMap(4)[2:3], 12),-1)
+chromosome.dendro=color_branches(as.dendrogram(hcd, hang = -1), groupLabels = T, col = colmap.dendro, clusters = metadata$Chromosome)
+
+# Reorder based on Euclidean distances between entries.
+hcd.row.global <- cluster_fun(dist(m))
+global.reorder <- data.frame(spearmanorder = hcd.row.global$order, subgroup = arrange(data,Subgroup)$Subgroup) %>%
+  mutate(original_order = row_number()) %>%
+  arrange(subgroup,spearmanorder) %>% subset(select=c("original_order")) %>% unlist()
+m.reordered <- arrange(data,Subgroup)[global.reorder,-1] %>% as.matrix()
+
+# Create the heatmap and save to pdf.
+pdf("Heatmaps/heatmap_global.pdf", height=5, width=8)
+lmat <- rbind( c(3,4), c(1,2) )
+lwid <- rbind( c(4,1.5))
+lhei <- rbind( c(2, 4.5))
+heatmap.2(m.reordered, dendrogram = "column", trace = 'none', Rowv = FALSE, Colv = chromosome.dendro,
+            hclust = cluster_fun, col = redBlueMap(100),
+            distfun = dist_fun, lmat = lmat, lwid = lwid, lhei = lhei, labCol = NA, 
+            labRow = rowLabels, rowsep = cumsum(count(data,Subgroup)$n)[1:2],
+            sepcolor = "black", main = NULL, cexRow = 1.5,
+            density.info = "none", margins = c(4.3,0.3))
+dev.off()
+```
+
+## Local heatmaps
+
+```{r}
+#importantChromosomes <- c(3, 6, 12, 16, 22)
+
+makeHeatmapPerChrom <- function(chromNum, thresh) {
+  
+  # Arrange data by subgroup and select data for needed chromosome.
+  arranged.data <- arrange(data,Subgroup)
+  m.local <- arranged.data[c(FALSE, metadata$Chromosome == chromNum)] %>% as.matrix()
+  
+  # Do hierarchical clustering on data and find a single chromosome per cluster. Let this be the middle one for each cluster.
+  # (labels become unreadable if we select more)
+  hcd.local <- cluster_fun(dist_fun(t(m.local)))
+  one_per_cluster <- data.frame(cluster = cutree(hcd.local, h=thresh))
+  one_per_cluster$chrom <- rownames(one_per_cluster)
+  one_per_cluster <- one_per_cluster %>% group_by(cluster) %>% 
+    mutate(chrom = ifelse(row_number() == ceiling(n()/2) & n()>=3, chrom, NA)) # Middle observation AND more than 3, then label.
+    
+  columnLabels.local <- one_per_cluster$chrom
+  
+  # Note rows of the data have been ordered by subgroup and we will separate them by a white line. Only plot labels on the y-axis for 
+  # the three observations that fall in the middle of the resulting blocks.
+  rowBreaks.local <- c(0,cumsum(tally(group_by(arrange(arranged.data,Subgroup)[1],Subgroup))$n))
+  rowsNeedingLabels <- round(1/2*(rowBreaks.local + lag(rowBreaks.local)))[-1]
+  rowsNeedingLabels.boolean <- rep(NA, dim(arranged.data)[1])
+  rowsNeedingLabels.boolean[rowsNeedingLabels] <- as.character(arranged.data$Subgroup[rowsNeedingLabels])
+  
+  # To obtain a better visualization, we want to reorder observations within subgroups based on their pairwise correlations. Do this by
+  # first doing a hierarchical clustering, then reorder within groups based on this clustering's order.
+  hcd.row.local <- cluster_fun(dist(m.local))
+  hcd.row.df <- data.frame(Subgroup = arranged.data$Subgroup[hcd.row.local$order], order = hcd.row.local$order) %>% 
+    mutate(rank = row_number()) %>% arrange(Subgroup, rank) %>% subset(select=c("order")) %>%
+    mutate(needsLabel = ifelse(row_number() %in% rowsNeedingLabels, T, F))
+  rowLabels.local <- rep(NA,dim(m.local)[1])
+  rowLabels.local[hcd.row.df$order[hcd.row.df$needsLabel]] <- as.character(arranged.data$Subgroup[hcd.row.df$order[hcd.row.df$needsLabel]])
+  
+  # A row order as `Rowv` argument for heatmap.2 does not work. Let us therefore reorder the original data based on ordering above.
+  rearranged.data <- arranged.data[hcd.row.df$order,]
+  m.local2 <- rearranged.data[c(FALSE, metadata$Chromosome == chromNum)] %>% as.matrix()
+  
+  # Specify height, width and element locations,
+  lmat <- rbind(c(5,4,0), c(0,1,0), c(3,2,0),c(0,0,0))
+  lhei <- c(3, .5, 8, 1)
+  lwid <- c(2, 10, 0)
+  
+  # Make heatmap with rearranging the rows and save them to a pdf.
+  pdf(paste0("Heatmaps/heatmap",chromNum,".pdf"), height=5, width=10)
+  hm <-heatmap.2(m.local2, key=T, dendrogram = "column", trace = 'none', Colv = as.dendrogram(hcd.local), Rowv = NA,
+              col = redBlueMap(100), labCol = columnLabels.local, labRow = rowsNeedingLabels.boolean, colsep = NA, margins = c(5,5),
+              rowsep = cumsum(count(arranged.data,Subgroup)$n)[1:2], sepcolor = "black", lmat = lmat, lhei = lhei, lwid = lwid,
+              ColSideColors=as.character(cutree(hcd.local, h = thresh)), density.info = c("histogram"), srtCol = 45, cexCol = .9,
+              key.title="Color Scale & Histogram", main = NA, cex.lab = 1.5, sepwidth = c(0,0.5))
+  dev.off()
+}
+
+#heatmap.2(m.reordered, dendrogram = "column", trace = 'none', Rowv = FALSE, Colv = chromosome.dendro,
+#            hclust = cluster_fun, col = redBlueMap(100),
+#            distfun = dist_fun, lmat = lmat, lwid = lwid, lhei = lhei, labCol = NA, 
+#            labRow = rowLabels, rowsep = cumsum(count(data,Subgroup)$n)[1:2],
+#            sepcolor = "black", main = NULL, cexRow = 1.5,
+#            density.info = "none", margins = c(4.3,0.3))
+
+# Create the heatmap and save to pdf.
+#pdf("Heatmaps/heatmap_global.pdf", height=5, width=8)
+
+ilapply <- function(X, FUN, ...) invisible(lapply(X, FUN, ...))
+ilapply(6, makeHeatmapPerChrom, thresh = .4)
+```
+
+## Cluster purity and number of clusters.
+
+```{r fig.height=3, fig.width=4}
+# Range for Spearman threshold correlations.
+rangeThresh <- seq(0,1,0.01)
+results <- sapply(rangeThresh, function (thresh) calculateNodeImpurityAndNumClusters(hcd,thresh)) %>% 
+  unlist() %>% matrix(ncol = 2, byrow = T) %>% as.data.frame()
+
+# Make a single plot showing both.
+nObs <- length(allChromosomes)
+purity.df <- data.frame(x = rangeThresh, purity = results$V1, numClusters = results$V2)
+pcplot <- ggplot(purity.df, aes(x=rangeThresh)) +
+  theme_classic() +
+  geom_line(aes(y = numClusters, colour =  "Number of clusters")) +
+  geom_line(aes(y = purity*nObs, colour = "Fractions cluster pure")) +
+  xlab(TeX("$1-\\rho$ threshold")) +
+  ylab("Number of clusters") +
+  theme(legend.position="top") +
+  scale_color_discrete(name=NULL) +
+  scale_y_continuous(breaks = seq(0,2500,500), sec.axis = sec_axis(~./nObs, name = "Cluster purity", labels = scales::percent)) + transp.background 
+
+ggsave("figs/purNumClusPlot.pdf", plot = pcplot, device="pdf", width=4, height=3)
+```
+
+## Perfect correlation between HER2+ and C17_350...
+
+```{r fig.height=3, fig.width=3.5}
+gainlossLabels <- c("-1" = "Loss", "0" = "No change", "1" = "Gain", "2" = "Amplification") 
+data[c("Subgroup","C17_35076296_35282086")] %>%
+  group_by(Subgroup, C17_35076296_35282086) %>% 
+  summarize(count = n()) %>%
+  ggplot(aes(x=Subgroup, y = count, fill = as.factor(C17_35076296_35282086)), labeller = gainlossLabels) +
+  geom_col() +
+  scale_fill_manual(values=viridis(4), 
+                       name="Abberations (C17: 35076296-35282086)",
+                       breaks=c("-1", "0", "1","2"),
+                       labels=c("Loss", "None", "Gain", "Amplification")) +
+  theme_classic() +
+  theme(legend.position = "top") +
+  xlab("Count") +
+  guides(fill = guide_legend(title.position="top", title.hjust = 0.5))
+
+ggsave("figs/abberations_c17.pdf", device = "pdf")
+ 
+```
+
